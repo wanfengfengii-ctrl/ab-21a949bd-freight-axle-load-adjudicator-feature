@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -201,4 +202,180 @@ func TestBridgeWindow_ExtremePositionsExact(t *testing.T) {
 	assert.Equal(t,
 		`{"max_load_kg":5000,"first_axle":2,"last_axle":2,"displacement_mm":0,"conclusion":"通行"}`,
 		string(raw))
+}
+
+// ---- 选填 speed_mm_per_s：超载区段与累计时长 ----
+
+// 提供合法车速时，原峰值字段保持不变，并在响应末尾追加超载区段列表与
+// 累计超载毫秒数；字段顺序与整段响应字节一并锁定。
+func TestBridgeWindow_WithSpeedReturnsOverloadSegments(t *testing.T) {
+	r := newRouter(t)
+	// 位置 [0,1000]、桥长 3000：唯一超载恒定载荷区段为位移 [1000,3000)、
+	// 载荷 14000；车速 1000 毫米每秒时毫秒数恰为 2000。
+	code, raw := doBridgeWindow(t, r,
+		`{"axle_positions_mm":[0,1000],"axle_loads_kg":[7000,7000],`+
+			`"bridge_length_mm":3000,"approved_load_kg":10000,"speed_mm_per_s":1000}`)
+	require.Equal(t, http.StatusOK, code, string(raw))
+	assert.Equal(t,
+		`{"max_load_kg":14000,"first_axle":1,"last_axle":2,"displacement_mm":1000,`+
+			`"conclusion":"拦停","overload_segments":[`+
+			`{"start_displacement_mm":1000,"end_displacement_mm":3000,`+
+			`"load_kg":14000,"duration_ms":2000}],"total_overload_duration_ms":2000}`,
+		string(raw))
+}
+
+// 毫秒数向上取整：2000mm × 1000 ÷ 3000 = 666.66… → 667。
+func TestBridgeWindow_SegmentDurationRoundsUp(t *testing.T) {
+	r := newRouter(t)
+	code, raw := doBridgeWindow(t, r,
+		`{"axle_positions_mm":[0,1000],"axle_loads_kg":[7000,7000],`+
+			`"bridge_length_mm":3000,"approved_load_kg":10000,"speed_mm_per_s":3000}`)
+	require.Equal(t, http.StatusOK, code, string(raw))
+	out := mustJSONMap(t, raw)
+	segments := out["overload_segments"].([]any)
+	require.Len(t, segments, 1)
+	seg := segments[0].(map[string]any)
+	assert.Equal(t, float64(667), seg["duration_ms"])
+	assert.Equal(t, float64(1000), seg["start_displacement_mm"])
+	assert.Equal(t, float64(3000), seg["end_displacement_mm"])
+	assert.Equal(t, float64(14000), seg["load_kg"])
+	assert.Equal(t, float64(667), out["total_overload_duration_ms"])
+}
+
+// 载荷逐段变化：不同恒定载荷区段不合并，按位移升序逐段返回，累计为五段之和。
+func TestBridgeWindow_DifferentConstantLoadsNotMerged(t *testing.T) {
+	r := newRouter(t)
+	code, raw := doBridgeWindow(t, r,
+		`{"axle_positions_mm":[0,1000,2000],"axle_loads_kg":[6000,1000,6000],`+
+			`"bridge_length_mm":3000,"approved_load_kg":5000,"speed_mm_per_s":1000}`)
+	require.Equal(t, http.StatusOK, code, string(raw))
+	out := mustJSONMap(t, raw)
+	// 原峰值裁决字段不变。
+	assert.Equal(t, float64(13000), out["max_load_kg"])
+	assert.Equal(t, float64(2000), out["displacement_mm"])
+	assert.Equal(t, "拦停", out["conclusion"])
+	type seg struct {
+		start, end, load, duration float64
+	}
+	var got []seg
+	for _, item := range out["overload_segments"].([]any) {
+		m := item.(map[string]any)
+		got = append(got, seg{m["start_displacement_mm"].(float64),
+			m["end_displacement_mm"].(float64), m["load_kg"].(float64),
+			m["duration_ms"].(float64)})
+	}
+	assert.Equal(t, []seg{
+		{0, 1000, 6000, 1000},
+		{1000, 2000, 7000, 1000},
+		{2000, 3000, 13000, 1000},
+		{3000, 4000, 7000, 1000},
+		{4000, 5000, 6000, 1000},
+	}, got)
+	assert.Equal(t, float64(5000), out["total_overload_duration_ms"])
+}
+
+// 同位移处进入先于离开产生的瞬时超载：只影响原峰值裁决（仍拦停），
+// 区段列表为空、累计时长为零。
+func TestBridgeWindow_InstantOverloadPeakOnlyAffectsPeak(t *testing.T) {
+	r := newRouter(t)
+	code, raw := doBridgeWindow(t, r,
+		`{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[4000,4000,4000],`+
+			`"bridge_length_mm":3000,"approved_load_kg":11000,"speed_mm_per_s":1000}`)
+	require.Equal(t, http.StatusOK, code, string(raw))
+	// 原峰值字段与不提供车速时完全一致，仅末尾追加空区段与零累计。
+	assert.Equal(t,
+		`{"max_load_kg":12000,"first_axle":1,"last_axle":3,"displacement_mm":3000,`+
+			`"conclusion":"拦停","overload_segments":[],"total_overload_duration_ms":0}`,
+		string(raw))
+}
+
+// 峰值未超载（通行）时区段为空、累计为零，但两个字段仍随车速请求出现。
+func TestBridgeWindow_WithSpeedPassingHasEmptySegments(t *testing.T) {
+	r := newRouter(t)
+	code, raw := doBridgeWindow(t, r,
+		`{"axle_positions_mm":[0,1000],"axle_loads_kg":[7000,7000],`+
+			`"bridge_length_mm":3000,"approved_load_kg":14000,"speed_mm_per_s":1000}`)
+	require.Equal(t, http.StatusOK, code, string(raw))
+	assert.True(t, bytes.Contains(raw, []byte(`"overload_segments":[]`)))
+	assert.True(t, bytes.Contains(raw, []byte(`"total_overload_duration_ms":0`)))
+	assert.True(t, bytes.Contains(raw, []byte(`"conclusion":"通行"`)))
+}
+
+// 省略车速与显式 null：均执行原分析，成功响应与引入车速能力前逐字节一致。
+func TestBridgeWindow_OmittedOrNullSpeedByteIdentical(t *testing.T) {
+	r := newRouter(t)
+	bodyWithout := `{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[4000,4000,4000],` +
+		`"bridge_length_mm":3000,"approved_load_kg":12000}`
+	bodyNull := `{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[4000,4000,4000],` +
+		`"bridge_length_mm":3000,"approved_load_kg":12000,"speed_mm_per_s":null}`
+	want := `{"max_load_kg":12000,"first_axle":1,"last_axle":3,` +
+		`"displacement_mm":3000,"conclusion":"通行"}`
+
+	_, omitted := doBridgeWindow(t, r, bodyWithout)
+	assert.Equal(t, want, string(omitted))
+	_, explicitNull := doBridgeWindow(t, r, bodyNull)
+	assert.Equal(t, want, string(explicitNull))
+	assert.Equal(t, omitted, explicitNull)
+	// 两种提交都不得出现新增字段。
+	for _, raw := range [][]byte{omitted, explicitNull} {
+		assert.NotContains(t, string(raw), "overload_segments")
+		assert.NotContains(t, string(raw), "total_overload_duration_ms")
+	}
+}
+
+// 车速字段类型错误、为零或越界：统一 422，只返回错误信封，不附带分析结果。
+func TestBridgeWindow_SpeedValidation422(t *testing.T) {
+	r := newRouter(t)
+	cases := []struct {
+		name  string
+		speed string
+	}{
+		{"车速为零", `0`},
+		{"车速为负", `-1`},
+		{"车速超上限", `50001`},
+		{"车速为小数", `1.5`},
+		{"车速为字符串", `"1000"`},
+		{"车速为布尔", `true`},
+		{"车速为数组", `[1000]`},
+		{"车速为对象", `{"v":1000}`},
+		{"字段名大小写变体", `null`}, // SPEED_MM_PER_S 走未知字段路径，单独构造见下
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			speedField := `"speed_mm_per_s":` + tc.speed
+			if tc.name == "字段名大小写变体" {
+				speedField = `"SPEED_MM_PER_S":1000`
+			}
+			body := `{"axle_positions_mm":[0,1000],"axle_loads_kg":[7000,7000],` +
+				`"bridge_length_mm":3000,"approved_load_kg":10000,` + speedField + `}`
+			code, raw := doBridgeWindow(t, r, body)
+			assert.Equal(t, http.StatusUnprocessableEntity, code, string(raw))
+			out := mustJSONMap(t, raw)
+			require.Contains(t, out, "error")
+			assert.Len(t, out, 1, "422 响应只能包含 error 字段")
+			for _, kw := range []string{"max_load_kg", "first_axle", "last_axle",
+				"displacement_mm", "conclusion", "overload_segments",
+				"total_overload_duration_ms"} {
+				assert.NotContains(t, string(raw), kw, "422 响应不得出现 %s", kw)
+			}
+		})
+	}
+}
+
+// 车速边界值 1 与 50000 合法；为零时错误信息明确指出车速范围。
+func TestBridgeWindow_SpeedBoundaries(t *testing.T) {
+	r := newRouter(t)
+	for _, speed := range []int{1, 50000} {
+		code, raw := doBridgeWindow(t, r,
+			`{"axle_positions_mm":[0],"axle_loads_kg":[1],`+
+				`"bridge_length_mm":1000,"approved_load_kg":1,`+
+				`"speed_mm_per_s":`+strconv.Itoa(speed)+`}`)
+		require.Equal(t, http.StatusOK, code, string(raw))
+	}
+	code, raw := doBridgeWindow(t, r,
+		`{"axle_positions_mm":[0],"axle_loads_kg":[1],`+
+			`"bridge_length_mm":1000,"approved_load_kg":1,"speed_mm_per_s":0}`)
+	require.Equal(t, http.StatusUnprocessableEntity, code, string(raw))
+	out := mustJSONMap(t, raw)
+	assert.Contains(t, out["error"], "车速")
 }

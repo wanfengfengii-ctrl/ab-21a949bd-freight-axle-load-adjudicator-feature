@@ -809,6 +809,258 @@ func main() {
 		return nil
 	})
 
+	// 省略预计车速时，桥面窗口响应与引入车速能力前逐字节一致：原五字段响应
+	// 原样返回，绝不夹带 overload_segments / total_overload_duration_ms。
+	check("桥面窗口：省略车速时既有响应字节不变", func() error {
+		code, body, err := postJSON(ctx, client, base+"/api/v1/bridge-window",
+			map[string]any{
+				"axle_positions_mm": []int{0, 1500, 3000},
+				"axle_loads_kg":     []int{4000, 4000, 4000},
+				"bridge_length_mm":  3000,
+				"approved_load_kg":  12000,
+			})
+		if err != nil {
+			return err
+		}
+		if code != http.StatusOK {
+			return fmt.Errorf("期望 200，实际 %d，响应 %s", code, body)
+		}
+		want := `{"max_load_kg":12000,"first_axle":1,"last_axle":3,` +
+			`"displacement_mm":3000,"conclusion":"通行"}`
+		if string(body) != want {
+			return fmt.Errorf("省略车速响应发生变化:\n期望 %s\n实际 %s", want, body)
+		}
+		if bytes.Contains(body, []byte("overload_segments")) ||
+			bytes.Contains(body, []byte("total_overload_duration_ms")) {
+			return fmt.Errorf("省略车速时不得返回区段字段: %s", body)
+		}
+
+		// 显式 null 与省略完全等价，响应同样逐字节不变。
+		code, bodyNull, err := postJSON(ctx, client, base+"/api/v1/bridge-window",
+			map[string]any{
+				"axle_positions_mm": []int{0, 1500, 3000},
+				"axle_loads_kg":     []int{4000, 4000, 4000},
+				"bridge_length_mm":  3000,
+				"approved_load_kg":  12000,
+				"speed_mm_per_s":    nil,
+			})
+		if err != nil {
+			return err
+		}
+		if code != http.StatusOK || !bytes.Equal(body, bodyNull) {
+			return fmt.Errorf("speed_mm_per_s=null 应与省略逐字节一致:\n%s\n%s", body, bodyNull)
+		}
+		return nil
+	})
+
+	// 持续超载：两轴各 7000、核定 10000，两轴同时落桥期间形成唯一一段
+	// 恒定载荷 14000 的超载区段 [1000,3000)；车速 3000 毫米每秒时
+	// 2000×1000÷3000 = 666.66… 向上取整为 667 毫秒。原峰值字段不变。
+	check("桥面窗口：持续超载区段载荷与向上取整时长", func() error {
+		code, body, err := postJSON(ctx, client, base+"/api/v1/bridge-window",
+			map[string]any{
+				"axle_positions_mm": []int{0, 1000},
+				"axle_loads_kg":     []int{7000, 7000},
+				"bridge_length_mm":  3000,
+				"approved_load_kg":  10000,
+				"speed_mm_per_s":    3000,
+			})
+		if err != nil {
+			return err
+		}
+		if code != http.StatusOK {
+			return fmt.Errorf("期望 200，实际 %d，响应 %s", code, body)
+		}
+		var got struct {
+			MaxLoadKg        json.Number `json:"max_load_kg"`
+			FirstAxle        int         `json:"first_axle"`
+			LastAxle         int         `json:"last_axle"`
+			DisplacementMm   int         `json:"displacement_mm"`
+			Conclusion       string      `json:"conclusion"`
+			OverloadSegments []struct {
+				StartDisplacementMm int         `json:"start_displacement_mm"`
+				EndDisplacementMm   int         `json:"end_displacement_mm"`
+				LoadKg              json.Number `json:"load_kg"`
+				DurationMs          int         `json:"duration_ms"`
+			} `json:"overload_segments"`
+			TotalOverloadDurationMs int `json:"total_overload_duration_ms"`
+		}
+		if err := json.Unmarshal(body, &got); err != nil {
+			return err
+		}
+		if got.MaxLoadKg.String() != "14000" || got.FirstAxle != 1 || got.LastAxle != 2 ||
+			got.DisplacementMm != 1000 || got.Conclusion != "拦停" {
+			return fmt.Errorf("原峰值字段与不带车速时不符: %s", body)
+		}
+		if len(got.OverloadSegments) != 1 {
+			return fmt.Errorf("期望恰好 1 个超载区段，实际 %d: %s",
+				len(got.OverloadSegments), body)
+		}
+		s := got.OverloadSegments[0]
+		if s.StartDisplacementMm != 1000 || s.EndDisplacementMm != 3000 ||
+			s.LoadKg.String() != "14000" || s.DurationMs != 667 {
+			return fmt.Errorf("超载区段不符: %+v", s)
+		}
+		if got.TotalOverloadDurationMs != 667 {
+			return fmt.Errorf("累计超载时长应为 667，实际 %d", got.TotalOverloadDurationMs)
+		}
+		return nil
+	})
+
+	// 载荷变化：平移过程中恒定载荷依次为 6000/7000/13000/7000/6000，
+	// 相邻区段载荷互不相等，必须逐段返回而不得合并，累计时长为五段之和。
+	check("桥面窗口：不同恒定载荷区段不合并", func() error {
+		code, body, err := postJSON(ctx, client, base+"/api/v1/bridge-window",
+			map[string]any{
+				"axle_positions_mm": []int{0, 1000, 2000},
+				"axle_loads_kg":     []int{6000, 1000, 6000},
+				"bridge_length_mm":  3000,
+				"approved_load_kg":  5000,
+				"speed_mm_per_s":    1000,
+			})
+		if err != nil {
+			return err
+		}
+		if code != http.StatusOK {
+			return fmt.Errorf("期望 200，实际 %d，响应 %s", code, body)
+		}
+		var got struct {
+			MaxLoadKg        json.Number `json:"max_load_kg"`
+			Conclusion       string      `json:"conclusion"`
+			OverloadSegments []struct {
+				StartDisplacementMm int         `json:"start_displacement_mm"`
+				EndDisplacementMm   int         `json:"end_displacement_mm"`
+				LoadKg              json.Number `json:"load_kg"`
+				DurationMs          int         `json:"duration_ms"`
+			} `json:"overload_segments"`
+			TotalOverloadDurationMs int `json:"total_overload_duration_ms"`
+		}
+		if err := json.Unmarshal(body, &got); err != nil {
+			return err
+		}
+		wantSegs := []struct {
+			start, end, duration int
+			load                 string
+		}{
+			{0, 1000, 1000, "6000"},
+			{1000, 2000, 1000, "7000"},
+			{2000, 3000, 1000, "13000"},
+			{3000, 4000, 1000, "7000"},
+			{4000, 5000, 1000, "6000"},
+		}
+		if len(got.OverloadSegments) != len(wantSegs) {
+			return fmt.Errorf("期望 %d 个不合并区段，实际 %d: %s",
+				len(wantSegs), len(got.OverloadSegments), body)
+		}
+		for i, want := range wantSegs {
+			s := got.OverloadSegments[i]
+			if s.StartDisplacementMm != want.start || s.EndDisplacementMm != want.end ||
+				s.LoadKg.String() != want.load || s.DurationMs != want.duration {
+				return fmt.Errorf("第 %d 区段不符: 期望 %+v，实际 %+v", i+1, want, s)
+			}
+		}
+		if got.MaxLoadKg.String() != "13000" || got.Conclusion != "拦停" {
+			return fmt.Errorf("原峰值裁决字段不符: %s", body)
+		}
+		if got.TotalOverloadDurationMs != 5000 {
+			return fmt.Errorf("累计超载时长应为 5000，实际 %d", got.TotalOverloadDurationMs)
+		}
+		return nil
+	})
+
+	// 同位移处进入先于离开：位移 3000 的瞬时三轴峰值 12000 超过核定值 11000，
+	// 原峰值仍裁决拦停；但该峰值位移长度为零，不进入区段、不计累计，
+	// overload_segments 为空、total_overload_duration_ms 为 0。
+	check("桥面窗口：瞬时超载仅影响原峰值且累计为零", func() error {
+		code, body, err := postJSON(ctx, client, base+"/api/v1/bridge-window",
+			map[string]any{
+				"axle_positions_mm": []int{0, 1500, 3000},
+				"axle_loads_kg":     []int{4000, 4000, 4000},
+				"bridge_length_mm":  3000,
+				"approved_load_kg":  11000,
+				"speed_mm_per_s":    1000,
+			})
+		if err != nil {
+			return err
+		}
+		if code != http.StatusOK {
+			return fmt.Errorf("期望 200，实际 %d，响应 %s", code, body)
+		}
+		var got struct {
+			MaxLoadKg               json.Number `json:"max_load_kg"`
+			DisplacementMm          int         `json:"displacement_mm"`
+			Conclusion              string      `json:"conclusion"`
+			OverloadSegments        []any       `json:"overload_segments"`
+			TotalOverloadDurationMs int         `json:"total_overload_duration_ms"`
+		}
+		if err := json.Unmarshal(body, &got); err != nil {
+			return err
+		}
+		if got.MaxLoadKg.String() != "12000" || got.DisplacementMm != 3000 ||
+			got.Conclusion != "拦停" {
+			return fmt.Errorf("瞬时峰值仍应参与原峰值裁决并拦停: %s", body)
+		}
+		if len(got.OverloadSegments) != 0 {
+			return fmt.Errorf("瞬时超载不得进入区段，实际 %d 个: %s",
+				len(got.OverloadSegments), body)
+		}
+		if got.TotalOverloadDurationMs != 0 {
+			return fmt.Errorf("瞬时超载累计时长应为 0，实际 %d", got.TotalOverloadDurationMs)
+		}
+		return nil
+	})
+
+	// 预计车速为零、越界或类型错误：统一 422 错误信封，绝不附带分析结果；
+	// 边界值 1 与 50000 合法。
+	check("桥面窗口：车速非法时 422 且无分析结果", func() error {
+		for _, speed := range []any{0, -1, 50001, "1000", true, []int{1000}} {
+			code, body, err := postJSON(ctx, client, base+"/api/v1/bridge-window",
+				map[string]any{
+					"axle_positions_mm": []int{0, 1000},
+					"axle_loads_kg":     []int{7000, 7000},
+					"bridge_length_mm":  3000,
+					"approved_load_kg":  10000,
+					"speed_mm_per_s":    speed,
+				})
+			if err != nil {
+				return err
+			}
+			if code != http.StatusUnprocessableEntity {
+				return fmt.Errorf("车速 %v 期望 422，实际 %d，响应 %s", speed, code, body)
+			}
+			var errResp struct {
+				Error string `json:"error"`
+			}
+			if err := json.Unmarshal(body, &errResp); err != nil || errResp.Error == "" {
+				return fmt.Errorf("车速 %v 的 422 响应缺少 error 字段: %s", speed, body)
+			}
+			for _, kw := range []string{"max_load_kg", "conclusion",
+				"overload_segments", "total_overload_duration_ms"} {
+				if bytes.Contains(body, []byte(kw)) {
+					return fmt.Errorf("车速 %v 的 422 响应夹带了分析结果（%s）: %s",
+						speed, kw, body)
+				}
+			}
+		}
+		for _, speed := range []int{1, 50000} {
+			code, body, err := postJSON(ctx, client, base+"/api/v1/bridge-window",
+				map[string]any{
+					"axle_positions_mm": []int{0},
+					"axle_loads_kg":     []int{1},
+					"bridge_length_mm":  1000,
+					"approved_load_kg":  1,
+					"speed_mm_per_s":    speed,
+				})
+			if err != nil {
+				return err
+			}
+			if code != http.StatusOK {
+				return fmt.Errorf("边界车速 %d 应合法，实际 %d，响应 %s", speed, code, body)
+			}
+		}
+		return nil
+	})
+
 	// 极大轴位置与载荷不设上限、不得溢出：极大载荷合计须作为 JSON 数字
 	// 精确返回（不得报成零或少算），极大位置下离开位移溢出仍须精确分析。
 	check("桥面窗口：极大轴位置与载荷精确计算不溢出", func() error {

@@ -14,23 +14,42 @@ import (
 )
 
 // bridgeRequest 为桥面承载窗口分析请求：轴位置按车头方向严格递增，
-// 载荷与轴一一对应，桥长与核定载荷为现场核定值。四个字段均必填。
+// 载荷与轴一一对应，桥长与核定载荷为现场核定值。前四个字段必填；
+// SpeedMmPerS 选填（缺省或 null 时不做超载区段分析，响应与引入该能力前
+// 逐字节一致）。
 type bridgeRequest struct {
 	AxlePositionsMm []int `json:"axle_positions_mm"`
 	AxleLoadsKg     []int `json:"axle_loads_kg"`
 	BridgeLengthMm  *int  `json:"bridge_length_mm"`
 	ApprovedLoadKg  *int  `json:"approved_load_kg"`
+	SpeedMmPerS     *int  `json:"speed_mm_per_s"`
+}
+
+// overloadSegmentResponse 为单个超载恒定载荷区段：[起始位移, 结束位移) 内
+// 桥面载荷恒为 load_kg，duration_ms 为按“位移差×1000÷车速”向上取整的毫秒数。
+type overloadSegmentResponse struct {
+	StartDisplacementMm json.Number `json:"start_displacement_mm"`
+	EndDisplacementMm   json.Number `json:"end_displacement_mm"`
+	LoadKg              json.Number `json:"load_kg"`
+	DurationMs          json.Number `json:"duration_ms"`
 }
 
 // bridgeResponse 为桥面承载窗口分析成功响应：最大桥面载荷、对应首尾轴
 // 序号、发生位移与通行或拦停结论。最大桥面载荷按任意精度整数输出
 // （json.Number 序列化为 JSON 数字，极大载荷不会溢出成零或变小）。
+//
+// 仅当请求提供合法 speed_mm_per_s 时追加超载区段列表与累计超载毫秒数
+// （指针非 nil 即输出，空列表输出 []、零时长输出 0）；未提供车速时两个
+// 字段整体省略，响应与引入车速能力前逐字节一致。
 type bridgeResponse struct {
 	MaxLoadKg      json.Number `json:"max_load_kg"`
 	FirstAxle      int         `json:"first_axle"`
 	LastAxle       int         `json:"last_axle"`
 	DisplacementMm int         `json:"displacement_mm"`
 	Conclusion     string      `json:"conclusion"`
+
+	OverloadSegments        *[]overloadSegmentResponse `json:"overload_segments,omitempty"`
+	TotalOverloadDurationMs *json.Number               `json:"total_overload_duration_ms,omitempty"`
 }
 
 // 桥面承载窗口分析明确约定的字段名；其它任何拼写（含大小写变体）都视为未知字段。
@@ -38,6 +57,7 @@ const (
 	keyAxlePositionsMm = "axle_positions_mm"
 	keyBridgeLengthMm  = "bridge_length_mm"
 	keyApprovedLoadKg  = "approved_load_kg"
+	keySpeedMmPerS     = "speed_mm_per_s"
 )
 
 func handleBridgeWindow(c *gin.Context) {
@@ -56,19 +76,35 @@ func handleBridgeWindow(c *gin.Context) {
 		AxleLoadsKg:     req.AxleLoadsKg,
 		BridgeLengthMm:  *req.BridgeLengthMm,
 		ApprovedLoadKg:  *req.ApprovedLoadKg,
+		SpeedMmPerS:     req.SpeedMmPerS,
 	})
 	if err != nil {
 		respond422(c, err.Error())
 		return
 	}
 
-	c.JSON(http.StatusOK, bridgeResponse{
+	resp := bridgeResponse{
 		MaxLoadKg:      json.Number(analysis.MaxLoadKg.String()),
 		FirstAxle:      analysis.FirstAxle,
 		LastAxle:       analysis.LastAxle,
 		DisplacementMm: analysis.DisplacementMm,
 		Conclusion:     analysis.Conclusion,
-	})
+	}
+	if req.SpeedMmPerS != nil {
+		segments := make([]overloadSegmentResponse, len(analysis.OverloadSegments))
+		for i, seg := range analysis.OverloadSegments {
+			segments[i] = overloadSegmentResponse{
+				StartDisplacementMm: json.Number(seg.StartDisplacementMm.String()),
+				EndDisplacementMm:   json.Number(seg.EndDisplacementMm.String()),
+				LoadKg:              json.Number(seg.LoadKg.String()),
+				DurationMs:          json.Number(seg.DurationMs.String()),
+			}
+		}
+		total := json.Number(analysis.TotalOverloadDurationMs.String())
+		resp.OverloadSegments = &segments
+		resp.TotalOverloadDurationMs = &total
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // decodeBridgeBody 读取并解析桥面承载窗口分析请求：请求体大小受限、
@@ -92,7 +128,8 @@ func decodeBridgeBody(c *gin.Context) (*bridgeRequest, bool) {
 	// 字段名须与明确契约逐字符一致：encoding/json 的字段匹配不区分大小写，
 	// 仅靠 DisallowUnknownFields 无法拒绝大小写变体，故先按契约名单精确扫描。
 	if key := firstNonContractKey(raw,
-		keyAxlePositionsMm, keyAxleLoadsKg, keyBridgeLengthMm, keyApprovedLoadKg); key != "" {
+		keyAxlePositionsMm, keyAxleLoadsKg, keyBridgeLengthMm, keyApprovedLoadKg,
+		keySpeedMmPerS); key != "" {
 		respond422(c, describeBridgeDecodeError(
 			errors.New("json: unknown field "+strconv.Quote(key))))
 		return nil, false
@@ -132,7 +169,8 @@ func describeBridgeDecodeError(err error) string {
 			"bridge_length_mm 与 approved_load_kg 的 JSON 对象"
 	case errors.As(err, new(*json.UnmarshalTypeError)):
 		return "字段类型错误：axle_positions_mm 与 axle_loads_kg 必须为整数数组，" +
-			"bridge_length_mm 与 approved_load_kg 必须为整数"
+			"bridge_length_mm 与 approved_load_kg 必须为整数，" +
+			"speed_mm_per_s 必须为整数或 null"
 	default:
 		// 含语法错误、未知字段、数字写入整型失败（如 1.5、超大数）等。
 		return "JSON 解析失败：" + err.Error()
