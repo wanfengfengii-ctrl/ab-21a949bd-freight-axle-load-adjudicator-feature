@@ -35,6 +35,20 @@ func views(windows []Window) []windowView {
 	return out
 }
 
+// intPtr 返回整数值的指针，用于构造选填车速。
+func intPtr(v int) *int { return &v }
+
+// assertSegment 校验一个超载区段：起止位移逐项相等，
+// 载荷与时长按十进制字符串比较（任意精度）。
+func assertSegment(t *testing.T, seg OverloadSegment, wantStart, wantEnd int,
+	wantLoadKg, wantDurationMs string) {
+	t.Helper()
+	assert.Equal(t, wantStart, seg.StartDisplacementMm, "区段起始位移")
+	assert.Equal(t, wantEnd, seg.EndDisplacementMm, "区段结束位移")
+	assert.Equal(t, wantLoadKg, seg.LoadKg.String(), "区段恒定载荷")
+	assert.Equal(t, wantDurationMs, seg.DurationMs.String(), "区段时长毫秒")
+}
+
 // 三轴车、桥面有效长度恰好等于首尾轴距：平移至车头轴抵达桥出口、
 // 车尾轴抵达桥入口的瞬间（位移 3000），边界上的前后轴均计入载荷，
 // 三轴合计 12000 达到峰值。
@@ -355,4 +369,141 @@ func TestScanWindows_LoadSnapshotsIndependent(t *testing.T) {
 	assert.Equal(t, "3", windows[0].LoadKg.String())
 	assert.Equal(t, "5", windows[1].LoadKg.String())
 	assert.Equal(t, "9223372036854775812", windows[2].LoadKg.String()) // MaxInt64+2+3
+}
+
+// 持续超载：三轴车以 7 毫米每秒通过，位移 1500-4500 区间载荷恒定 8000 千克
+// 超过核定值 7000。位移 3000 处先进入后离开的瞬时峰值 12000 仍参与峰值裁决，
+// 但其位移长度为零不进入区段；两侧 8000 千克区段相邻且载荷相同，合并为一段。
+// 时长 3000×1000÷7 = 428571.43 向上取整为 428572 毫秒。
+func TestAnalyze_OverloadSegmentsContinuousOverload(t *testing.T) {
+	got, err := Analyze(Input{
+		AxlePositionsMm: []int{0, 1500, 3000},
+		AxleLoadsKg:     []int{4000, 4000, 4000},
+		BridgeLengthMm:  3000,
+		ApprovedLoadKg:  7000,
+		SpeedMmPerS:     intPtr(7),
+	})
+	require.NoError(t, err)
+	assertAnalysis(t, "12000", 1, 3, 3000, ConclusionStop, got)
+	require.Len(t, got.OverloadSegments, 1)
+	assertSegment(t, got.OverloadSegments[0], 1500, 4500, "8000", "428572")
+	require.NotNil(t, got.OverloadDurationMs)
+	assert.Equal(t, "428572", got.OverloadDurationMs.String(), "累计超载时长")
+}
+
+// 载荷变化：相邻超载区段载荷分别为 7000 与 9000 千克，载荷不同不得合并。
+// 车速 1000 毫米每秒时每段 1500 毫米恰好 1500 毫秒（整除不向上进位）。
+func TestAnalyze_OverloadSegmentsDifferentLoadsNotMerged(t *testing.T) {
+	got, err := Analyze(Input{
+		AxlePositionsMm: []int{0, 1500, 3000},
+		AxleLoadsKg:     []int{5000, 4000, 3000},
+		BridgeLengthMm:  3000,
+		ApprovedLoadKg:  6000,
+		SpeedMmPerS:     intPtr(1000),
+	})
+	require.NoError(t, err)
+	assertAnalysis(t, "12000", 1, 3, 3000, ConclusionStop, got)
+	require.Len(t, got.OverloadSegments, 2)
+	assertSegment(t, got.OverloadSegments[0], 1500, 3000, "7000", "1500")
+	assertSegment(t, got.OverloadSegments[1], 3000, 4500, "9000", "1500")
+	assert.Equal(t, "3000", got.OverloadDurationMs.String(), "累计超载时长")
+}
+
+// 同位移进出：车尾轴恰抵桥出口的瞬间车头轴恰抵桥入口，瞬时两轴同桥
+// 10000 千克超过核定值 8000 触发拦停；但瞬时状态位移长度为零，
+// 不进入区段与累计时长——区段清单为空、累计时长为零。
+func TestAnalyze_InstantaneousOverloadOnlyAffectsPeak(t *testing.T) {
+	got, err := Analyze(Input{
+		AxlePositionsMm: []int{0, 3000},
+		AxleLoadsKg:     []int{5000, 5000},
+		BridgeLengthMm:  3000,
+		ApprovedLoadKg:  8000,
+		SpeedMmPerS:     intPtr(1000),
+	})
+	require.NoError(t, err)
+	assertAnalysis(t, "10000", 1, 2, 3000, ConclusionStop, got)
+	require.NotNil(t, got.OverloadSegments, "提供车速时区段清单不得为 nil")
+	assert.Empty(t, got.OverloadSegments)
+	require.NotNil(t, got.OverloadDurationMs)
+	assert.Equal(t, "0", got.OverloadDurationMs.String(), "累计超载时长")
+}
+
+// 同位移进出且两侧区段载荷相同：瞬时峰值 10000 只参与峰值裁决，
+// 两侧 5000 千克区段相邻同载荷合并为 [0,6000] 一段。车速 7 毫米每秒时
+// 合并后时长 6000×1000÷7 向上取整为 857143 毫秒；若先各自取整再相加
+// 会得到 2×428572 = 857144——锁定“先合并再按时长公式计算”的次序。
+func TestAnalyze_SameLoadSegmentsMergedBeforeDuration(t *testing.T) {
+	got, err := Analyze(Input{
+		AxlePositionsMm: []int{0, 3000},
+		AxleLoadsKg:     []int{5000, 5000},
+		BridgeLengthMm:  3000,
+		ApprovedLoadKg:  4000,
+		SpeedMmPerS:     intPtr(7),
+	})
+	require.NoError(t, err)
+	assertAnalysis(t, "10000", 1, 2, 3000, ConclusionStop, got)
+	require.Len(t, got.OverloadSegments, 1)
+	assertSegment(t, got.OverloadSegments[0], 0, 6000, "5000", "857143")
+	assert.Equal(t, "857143", got.OverloadDurationMs.String(), "累计超载时长")
+}
+
+// 未提供车速：不计算超载区段与累计时长，两个新字段均为 nil，
+// 分析行为与引入车速能力前完全一致。
+func TestAnalyze_NoSpeedLeavesOverloadFieldsNil(t *testing.T) {
+	got, err := Analyze(Input{
+		AxlePositionsMm: []int{0, 1500, 3000},
+		AxleLoadsKg:     []int{4000, 4000, 4000},
+		BridgeLengthMm:  3000,
+		ApprovedLoadKg:  12000,
+	})
+	require.NoError(t, err)
+	assertAnalysis(t, "12000", 1, 3, 3000, ConclusionPass, got)
+	assert.Nil(t, got.OverloadSegments)
+	assert.Nil(t, got.OverloadDurationMs)
+}
+
+// 极大轴位置下提供车速：车头轴在桥 3000 毫米超载正常产出区段；
+// 车尾轴的离开位移超出 int 范围，其超载区间不产出区段
+// （真实结束位移无法用 int 表示，与溢出事件不产出窗口快照同理）。
+func TestAnalyze_ExtremePositionsWithSpeed(t *testing.T) {
+	got, err := Analyze(Input{
+		AxlePositionsMm: []int{0, math.MaxInt64},
+		AxleLoadsKg:     []int{4000, 5000},
+		BridgeLengthMm:  3000,
+		ApprovedLoadKg:  3000,
+		SpeedMmPerS:     intPtr(1000),
+	})
+	require.NoError(t, err)
+	assertAnalysis(t, "5000", 2, 2, 0, ConclusionStop, got)
+	require.Len(t, got.OverloadSegments, 1)
+	assertSegment(t, got.OverloadSegments[0], 0, 3000, "5000", "3000")
+	assert.Equal(t, "3000", got.OverloadDurationMs.String())
+}
+
+// 车速校验：零、负值与越界均非法；边界 1 与 50000 毫米每秒合法。
+func TestValidate_SpeedRange(t *testing.T) {
+	valid := func() Input {
+		return Input{
+			AxlePositionsMm: []int{0, 1500, 3000},
+			AxleLoadsKg:     []int{4000, 4000, 4000},
+			BridgeLengthMm:  3000,
+			ApprovedLoadKg:  12000,
+		}
+	}
+	for _, speed := range []int{0, -1, -100, 50001, 100000} {
+		in := valid()
+		in.SpeedMmPerS = intPtr(speed)
+		err := Validate(in)
+		require.Error(t, err, "车速 %d 应非法", speed)
+		assert.Contains(t, err.Error(), "车速")
+
+		res, err := Analyze(in)
+		require.Error(t, err)
+		assert.Nil(t, res, "非法车速不得产出任何分析结果")
+	}
+	for _, speed := range []int{MinSpeedMmPerS, MaxSpeedMmPerS} {
+		in := valid()
+		in.SpeedMmPerS = intPtr(speed)
+		assert.NoError(t, Validate(in), "车速 %d 应合法", speed)
+	}
 }

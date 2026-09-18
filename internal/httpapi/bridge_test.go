@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -114,7 +115,7 @@ func TestBridgeWindow_422Cases(t *testing.T) {
 			require.Contains(t, out, "error")
 			// 统一 422：只返回错误信封，绝不夹带任何分析结果。
 			for _, kw := range []string{"max_load_kg", "first_axle", "last_axle",
-				"displacement_mm", "conclusion"} {
+				"displacement_mm", "conclusion", "overload_segments", "total_overload_duration_ms"} {
 				assert.NotContains(t, string(raw), kw, "422 响应不得出现 %s", kw)
 			}
 		})
@@ -201,4 +202,120 @@ func TestBridgeWindow_ExtremePositionsExact(t *testing.T) {
 	assert.Equal(t,
 		`{"max_load_kg":5000,"first_axle":2,"last_axle":2,"displacement_mm":0,"conclusion":"通行"}`,
 		string(raw))
+}
+
+// 持续超载：三轴车以 7 毫米每秒通过，位移 1500-4500 载荷恒定 8000 千克超载；
+// 同位移瞬时峰值不进入区段，两侧同载荷区段合并为一段，
+// 时长 3000×1000÷7 向上取整为 428572 毫秒。响应字段顺序与字节一并锁定。
+func TestBridgeWindow_SpeedContinuousOverload(t *testing.T) {
+	r := newRouter(t)
+	code, raw := doBridgeWindow(t, r,
+		`{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[4000,4000,4000],`+
+			`"bridge_length_mm":3000,"approved_load_kg":7000,"speed_mm_per_s":7}`)
+	require.Equal(t, http.StatusOK, code, string(raw))
+	assert.Equal(t,
+		`{"max_load_kg":12000,"first_axle":1,"last_axle":3,"displacement_mm":3000,"conclusion":"拦停",`+
+			`"overload_segments":[{"start_displacement_mm":1500,"end_displacement_mm":4500,`+
+			`"load_kg":8000,"duration_ms":428572}],"total_overload_duration_ms":428572}`,
+		string(raw))
+}
+
+// 载荷变化：相邻超载区段载荷 7000 与 9000 不同，不得合并为一段。
+func TestBridgeWindow_SpeedDifferentLoadsNotMerged(t *testing.T) {
+	r := newRouter(t)
+	code, raw := doBridgeWindow(t, r,
+		`{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[5000,4000,3000],`+
+			`"bridge_length_mm":3000,"approved_load_kg":6000,"speed_mm_per_s":1000}`)
+	require.Equal(t, http.StatusOK, code, string(raw))
+	assert.Equal(t,
+		`{"max_load_kg":12000,"first_axle":1,"last_axle":3,"displacement_mm":3000,"conclusion":"拦停",`+
+			`"overload_segments":[`+
+			`{"start_displacement_mm":1500,"end_displacement_mm":3000,"load_kg":7000,"duration_ms":1500},`+
+			`{"start_displacement_mm":3000,"end_displacement_mm":4500,"load_kg":9000,"duration_ms":1500}],`+
+			`"total_overload_duration_ms":3000}`,
+		string(raw))
+}
+
+// 同位移进出：瞬时两轴同桥 10000 千克超过核定值触发拦停，但瞬时状态
+// 位移长度为零——超载区段为空数组、累计时长为零，瞬时超载仅影响原峰值。
+func TestBridgeWindow_SpeedInstantaneousOverloadZeroDuration(t *testing.T) {
+	r := newRouter(t)
+	code, raw := doBridgeWindow(t, r,
+		`{"axle_positions_mm":[0,3000],"axle_loads_kg":[5000,5000],`+
+			`"bridge_length_mm":3000,"approved_load_kg":8000,"speed_mm_per_s":1000}`)
+	require.Equal(t, http.StatusOK, code, string(raw))
+	assert.Equal(t,
+		`{"max_load_kg":10000,"first_axle":1,"last_axle":2,"displacement_mm":3000,"conclusion":"拦停",`+
+			`"overload_segments":[],"total_overload_duration_ms":0}`,
+		string(raw))
+}
+
+// 车速为 null 与缺省等价：响应与不携带车速字段时逐字节一致。
+func TestBridgeWindow_NullSpeedByteIdenticalToOmitted(t *testing.T) {
+	r := newRouter(t)
+	body := `{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[4000,4000,4000],` +
+		`"bridge_length_mm":3000,"approved_load_kg":12000`
+	code, withNull := doBridgeWindow(t, r, body+`,"speed_mm_per_s":null}`)
+	require.Equal(t, http.StatusOK, code, string(withNull))
+	code, omitted := doBridgeWindow(t, r, body+`}`)
+	require.Equal(t, http.StatusOK, code, string(omitted))
+	assert.Equal(t, string(omitted), string(withNull))
+	assert.Equal(t,
+		`{"max_load_kg":12000,"first_axle":1,"last_axle":3,"displacement_mm":3000,"conclusion":"通行"}`,
+		string(withNull))
+}
+
+// 车速边界值 1 与 50000 毫米每秒均合法；单轴超载区段时长随车速变化。
+func TestBridgeWindow_SpeedBoundariesAccepted(t *testing.T) {
+	r := newRouter(t)
+	for _, tc := range []struct {
+		speed    int
+		duration string
+	}{
+		{1, "1000000"}, // 1000 毫米 ×1000 ÷1
+		{50000, "20"},  // 1000 毫米 ×1000 ÷50000 = 20 整除
+	} {
+		code, raw := doBridgeWindow(t, r,
+			`{"axle_positions_mm":[0],"axle_loads_kg":[2],"bridge_length_mm":1000,`+
+				`"approved_load_kg":1,"speed_mm_per_s":`+strconv.Itoa(tc.speed)+`}`)
+		require.Equal(t, http.StatusOK, code, string(raw))
+		assert.Equal(t,
+			`{"max_load_kg":2,"first_axle":1,"last_axle":1,"displacement_mm":0,"conclusion":"拦停",`+
+				`"overload_segments":[{"start_displacement_mm":0,"end_displacement_mm":1000,`+
+				`"load_kg":2,"duration_ms":`+tc.duration+`}],"total_overload_duration_ms":`+tc.duration+`}`,
+			string(raw))
+	}
+}
+
+// 车速类型错误、为零或越界：统一 422，只返回错误信封，不附带任何分析结果。
+func TestBridgeWindow_InvalidSpeed422(t *testing.T) {
+	r := newRouter(t)
+	base := `{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[4000,4000,4000],` +
+		`"bridge_length_mm":3000,"approved_load_kg":12000,"speed_mm_per_s":`
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"车速为零", base + `0}`},
+		{"车速为负", base + `-1}`},
+		{"车速高于上限", base + `50001}`},
+		{"车速为小数", base + `1.5}`},
+		{"车速为字符串", base + `"1000"}`},
+		{"车速为布尔", base + `true}`},
+		{"车速字段名大小写变体", `{"axle_positions_mm":[0,1500,3000],"axle_loads_kg":[4000,4000,4000],` +
+			`"bridge_length_mm":3000,"approved_load_kg":12000,"SPEED_MM_PER_S":1000}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, raw := doBridgeWindow(t, r, tc.body)
+			require.Equal(t, http.StatusUnprocessableEntity, code, string(raw))
+			out := mustJSONMap(t, raw)
+			require.Contains(t, out, "error")
+			assert.Len(t, out, 1, "422 响应只能包含 error 字段")
+			for _, kw := range []string{"max_load_kg", "first_axle", "last_axle",
+				"displacement_mm", "conclusion", "overload_segments", "total_overload_duration_ms"} {
+				assert.NotContains(t, string(raw), kw, "422 响应不得出现 %s", kw)
+			}
+		})
+	}
 }
