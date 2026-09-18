@@ -1,0 +1,31 @@
+name: axleverify
+
+services:
+  # 常驻车轴复核 API。宿主端口由环境变量 API_PORT 覆盖（默认 8080），
+  # 容器内部固定监听 8080，例如：API_PORT=9090 docker compose up -d
+  api:
+    build:
+      context: .
+      target: runtime
+    image: axleverify:latest
+    environment:
+      API_PORT: "8080"
+    ports:
+      - "${API_PORT:-8080}:8080"
+    restart: unless-stopped
+
+  # 一次性验收服务：等待 api 就绪后执行黑盒用例（含 1800/1801 毫米临界两侧、
+  # 422 非法输入、响应可重复性、地磅校准，以及重测比对的两次一致确认、
+  # 载荷变化超限翻转、轴距变化分组重排、第二份非法无部分结果、
+  # 非 JSON 媒体类型拒绝、字段名大小写变体按未知字段拒绝，以及桥面承载窗口
+  # 分析的边界恰好容纳前后轴计入载荷、平移后峰值触发拦停、并列峰值选择
+  # 最早事件、位置重复只返回错误信封等），全部通过即退出码 0，
+  # 否则非 0。运行方式：docker compose build && docker compose run --rm verify
+  verify:
+    image: axleverify:latest
+    entrypoint: ["/app/acceptance"]
+    environment:
+      BASE_URL: http://api:8080
+    depends_on:
+      - api
+    restart: "no"

@@ -1,0 +1,9 @@
+# 编译产物
+/server
+/acceptance
+*.test
+*.out
+
+# 本地环境
+.env
+.DS_Store
